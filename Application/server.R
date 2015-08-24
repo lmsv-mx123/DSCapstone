@@ -1,0 +1,388 @@
+#--------------------------------------------------
+# R Server Code for the Capstone Project Shiny App
+#--------------------------------------------------
+
+suppressWarnings(library(tm))
+suppressWarnings(library(stringr))
+suppressWarnings(library(shiny))
+
+# Load the unigram, bigrams, trigrams, quadgrams, and pentagram data files.
+# These files contain the n-grams phrase along with their normalized occurence
+# in descending order. For limitations on shiny app and the sampled corpora not
+# big enough for higher order n-grams, the highest one is 5.
+
+unigrams <- read.table("./unigramsLst.txt", sep = ",",
+                       col.names=c("Phrase","Ocurrence"),stringsAsFactors = FALSE)
+bigrams <- read.table("./bigramsLst.txt", sep = ",",
+                      col.names=c("Phrase","Ocurrence"),stringsAsFactors = FALSE)
+trigrams <- read.table("./trigramsLst.txt", sep = ",",
+                       col.names=c("Phrase","Ocurrence"),stringsAsFactors = FALSE)
+quadgrams <- read.table("./quadgramsLst.txt", sep = ",",
+                        col.names=c("Phrase","Ocurrence"),stringsAsFactors = FALSE)
+pentagrams <- read.table("./pentagramsLst.txt", sep = ",",
+                         col.names=c("Phrase","Ocurrence"),stringsAsFactors = FALSE)
+otherTerms <- as.character(NULL);
+
+#-------------------------------------------------
+# Function to clean up the input string
+# to improve accuracy on next predicted term
+#-------------------------------------------------
+CleanString <- function(inStr)
+{
+  
+  # Remove non-alphabatical characters
+  inStr <- iconv(inStr, "latin1", "ASCII", sub=" ");
+  inStr <- gsub("[^[:alpha:][:space:][:punct:]]", "", inStr);
+  
+  # Convert to a Corpus
+  inStrCrps <- VCorpus(VectorSource(inStr))
+  
+  toSpace <- content_transformer(function(x, pattern) gsub(pattern, " ", x))
+  
+  # Change to lower case
+  inStrCrps <- tm_map(inStrCrps, content_transformer(tolower))
+  # Remove tags (#,@)
+  inStrCrps <- tm_map(inStrCrps, toSpace, "(^|\\s)(#|@)[a-z0-9_]+")
+  # Remove web URIs
+  inStrCrps <- tm_map(inStrCrps, toSpace, "((https?|ftp)://)?www\\.[a-z0-9]+\\.[a-z0-9.]{2,}")
+  # Limit consecutive characters to 2
+  inStrCrps <- tm_map(inStrCrps, content_transformer(function(x) gsub("([a-z0-9])\\1+", "\\1\\1", x)))
+  # Remove punctuation
+  inStrCrps <- tm_map(inStrCrps, removePunctuation)
+  # Remove numbers
+  inStrCrps <- tm_map(inStrCrps, removeNumbers)
+  # Remove unnecessary spaces
+  inStrCrps <- tm_map(inStrCrps, stripWhitespace)
+  # Transform to plain text
+  inStrCrps <- tm_map(inStrCrps, PlainTextDocument)
+  
+  inStr <- as.character(inStrCrps[[1]])
+  inStr <- gsub("(^[[:space:]]+|[[:space:]]+$)", "", inStr)
+  
+  # Return the cleaned sentence
+  # If the sentence is empty, an empty string is returned.
+  if (nchar(inStr) > 0) {
+    return(inStr); 
+  } else {
+    return("");
+  }
+}
+
+# Description of the Prediction Algorithm
+#----------------------------------------------
+# To predict the next term from a user specified sentence, the following is made
+# 1. Start from the highest n-gram file that can be used from previous terms
+#    entered.
+# 2. Search for the five most phrases that match previous terms on the highest
+#    n-gram
+# 3. If at least one term was found, the adjusted normalized ocurrence is
+#    the same as the normalized ocurrence.
+# 4. Decrease the degree of the ngram and perform step 2. The adjusted normalized
+#    ocurrence will be a factor of the normalized occurence if there were phrases
+#    found on the higher ngram.
+# 5. Repeat step 4 up to arriving (and including) the bigrams.
+# 6. The last term from each of the ngram becomes the possible predicted terms.
+# 7. Aggregate the terms with their adjusted normalized ocurrence.
+# 8. Keep only those terms that have not been used in the previous terms (up to the 4 last)
+# 9. Present up to 5 of the suggested next terms
+
+PredNextTerm <- function(inStr)
+{
+  
+  # Perform cleaning of the input string
+  cleanInStr <- CleanString(inStr);
+  
+  # Split string into its terms and save the number of terms
+  inStr <- unlist(strsplit(cleanInStr, split=" "));
+  inStrLen <- length(inStr);
+  
+  if(inStrLen < 1) {
+    last <- ""
+  }
+  else {
+    last <- inStr[inStrLen];
+  }
+  
+  # Previous terms on the clean input string
+  if(inStrLen < 2) {
+    prev1Last <- last;
+  }
+  else {
+    prev1Last <- inStr[inStrLen-1];
+  }
+  if(inStrLen < 3) {
+    prev2Last <- last;
+  }
+  else {
+    prev2Last <- inStr[inStrLen-2];
+  }
+  if(inStrLen < 4) {
+    prev3Last <- last;
+  }
+  else {
+    prev3Last <- inStr[inStrLen-3];
+  }
+  
+  # Vector of the possible next terms, across the ngrams
+  vectTermsTmp <- data.frame(Phrase=character(), Ocurrence=numeric(), stringsAsFactors=FALSE)
+  predNxtTerm <- as.character(NULL);
+  
+  adjustedFactor <- -1;
+  # The adjusting factor between consecutive ngrams
+  # For example to choose a bigram over a trigram, the normalized ocurrence of the trigram has
+  # to be at least "factor" smaller than the normalized ocurrece of the bigram
+  reducingFactor <- 0.3;
+  
+  # Possible terms from pentagrams
+  if (inStrLen >= 4)
+  {
+    # Form forward search string
+    inStr1 <- paste(inStr[(inStrLen-3):inStrLen], collapse=" ");
+     
+    searchStr <- paste("^",inStr1, sep = "");
+    searchStr <- paste(searchStr," ", sep = "");
+    # Backward search string
+    searchStr2 <- paste(prev3Last,prev2Last,prev1Last,last, sep=" ");
+    searchStr2 <- paste("(?:",searchStr2,"$)", sep="");
+    # Subset the Pentagrams into those matching only the search strings
+    pentagramsTmp <- pentagrams[grep (searchStr, pentagrams$Phrase),];
+    pentagramsTmp <- pentagramsTmp[grep (searchStr2, pentagramsTmp$Phrase, invert=TRUE),];
+    
+    # Check if there is at least a pentagram from the query
+    if ( nrow(pentagramsTmp) >= 1 )
+    {
+      
+      # Set the adjusting factor as necessary
+      if(adjustedFactor == -1) {
+        adjustedFactor = 1;
+      }
+      else {
+        adjustedFactor = adjustedFactor * reducingFactor;
+      }
+      
+      # Add at most the 5 top pentagrams, to the vector of possible terms
+      pentagramsTmp$Ocurrence = pentagramsTmp$Ocurrence * adjustedFactor
+      vectTermsTmp <- rbind(vectTermsTmp,na.omit(pentagramsTmp[1:5,]))
+      
+    }
+    else {
+      if(adjustedFactor != -1) {
+        adjustedFactor = adjustedFactor * reducingFactor;
+      }
+    }
+    pentagramsTmp <- NULL;
+  }
+  
+  # Possible terms from quadgrams
+  if (inStrLen >= 3)
+  {
+    # Form forward search string
+    inStr1 <- paste(inStr[(inStrLen-2):inStrLen], collapse=" ");
+    
+    searchStr <- paste("^",inStr1, sep = "");
+    searchStr <- paste(searchStr," ", sep = "");
+    # Backward search string
+    searchStr2 <- paste(prev2Last,prev1Last,last, sep=" ");
+    searchStr2 <- paste("(?:",searchStr2,"$)", sep="");
+    # Subset the Quadgrams into those matching only the search strings
+    quadgramsTmp <- quadgrams[grep (searchStr, quadgrams$Phrase),];
+    quadgramsTmp <- quadgramsTmp[grep (searchStr2, quadgramsTmp$Phrase, invert=TRUE),];
+    
+    # Check if there is at least a quadgram from the query
+    if ( nrow(quadgramsTmp) >= 1 )
+    {
+      # Set the adjusting factor as necessary
+      if(adjustedFactor == -1) {
+        adjustedFactor = 1;
+      }
+      else {
+        adjustedFactor = adjustedFactor * reducingFactor;
+      }
+      
+      # Add at most the 5 top quadgrams, to the vector of possible terms
+      quadgramsTmp$Ocurrence = quadgramsTmp$Ocurrence * adjustedFactor
+      vectTermsTmp <- rbind(vectTermsTmp,na.omit(quadgramsTmp[1:5,]))
+      
+    }
+    else {
+      if(adjustedFactor != -1) {
+        adjustedFactor = adjustedFactor * reducingFactor;
+      }
+    }
+    quadgramsTmp <- NULL;
+  }
+  
+  # Possible terms from trigrams
+  if (inStrLen >= 2)
+  {
+    # Form forward search string
+    inStr1 <- paste(inStr[(inStrLen-1):inStrLen], collapse=" ");
+    
+    searchStr <- paste("^",inStr1, sep = "");
+    searchStr <- paste(searchStr," ", sep = "");
+    # Backward search string
+    searchStr2 <- paste(prev1Last,last, sep=" ");
+    searchStr2 <- paste("(?:",searchStr2,"$)", sep="");
+    # Subset the Trigrams into those matching only the search strings
+    trigramsTmp <- trigrams[grep (searchStr, trigrams$Phrase),];
+    trigramsTmp <- trigramsTmp[grep (searchStr2, trigramsTmp$Phrase, invert=TRUE),];
+    
+    # Check if there is at least a trigram from the query
+    if ( nrow(trigramsTmp) >= 1 )
+    {
+      # Set the adjusting factor as necessary
+      if(adjustedFactor == -1) {
+        adjustedFactor = 1;
+      }
+      else {
+        adjustedFactor = adjustedFactor * reducingFactor;
+      }
+      
+      # Add at most the 5 top trigrams, to the vector of possible terms
+      trigramsTmp$Ocurrence = trigramsTmp$Ocurrence * adjustedFactor
+      vectTermsTmp <- rbind(vectTermsTmp,na.omit(trigramsTmp[1:5,]))
+      
+    }
+    else {
+      if(adjustedFactor != -1) {
+        adjustedFactor = adjustedFactor * reducingFactor;
+      }
+    }
+    trigramsTmp <- NULL;
+  }
+  
+  # Possible terms from bigrams
+  if (inStrLen >= 1)
+  {
+    # Form forward search string
+    inStr1 <- inStr[inStrLen];
+    
+    searchStr <- paste("^",inStr1, sep = "");
+    searchStr <- paste(searchStr," ", sep = "");
+    # Backward search string
+    searchStr2 <- paste(last, sep=" ");
+    searchStr2 <- paste("(?:",searchStr2,"$)", sep="");
+    # Subset the Trigrams into those matching only the search strings
+    bigramsTmp <- bigrams[grep (searchStr, bigrams$Phrase),];
+    bigramsTmp <- bigramsTmp[grep (searchStr2, bigramsTmp$Phrase, invert=TRUE),];
+    
+    # Check if there is at least a trigram from the query
+    if ( nrow(bigramsTmp) >= 1 )
+    {
+      # Set the adjusting factor as necessary
+      if(adjustedFactor == -1) {
+        adjustedFactor = 1;
+      }
+      else {
+        adjustedFactor = adjustedFactor * reducingFactor;
+      }
+      
+      # Add at most the 5 top bigrams, to the vector of possible terms
+      bigramsTmp$Ocurrence = bigramsTmp$Ocurrence * adjustedFactor
+      vectTermsTmp <- rbind(vectTermsTmp,na.omit(bigramsTmp[1:5,]))
+      
+    }
+    else {
+      if(adjustedFactor != -1) {
+        adjustedFactor = adjustedFactor * reducingFactor;
+      }
+    }
+    bigramsTmp <- NULL;
+  }
+  
+  # When no terms are found on pentagrams, quadgrams, trigrams or bigrams
+  # Choose from the top unigrams
+  if ( nrow(vectTermsTmp) == 0 )
+  {
+    unigramsTmp <- unigrams[grep ("", unigrams$Phrase),];
+    
+    if(adjustedFactor == -1) {
+      adjustedFactor = 1;
+    }
+    else {
+      adjustedFactor = adjustedFactor * reducingFactor;
+    }
+    
+    # Add 5 unigrams (to fill up suggested words in case)
+    unigramsTmp$Ocurrence = unigramsTmp$Ocurrence * adjustedFactor
+    vectTermsTmp <- rbind(vectTermsTmp,na.omit(unigramsTmp[1:5,]))
+  }
+  # Sort the possible phrases by adjusted ocurrence and keep only last term
+  sorted <- vectTermsTmp[ order(-vectTermsTmp$Ocurrence), ]
+  
+  for(i in 1:nrow(sorted)) {
+    tmp <- sorted$Phrase[i];
+    tmp <- unlist(strsplit(tmp, split=" "));
+    tmp <- tmp[length(tmp)]
+    sorted$Phrase[i] <- tmp
+  }
+  
+  # Aggregate to have unique terms
+  aggregated <- aggregate(sorted$Ocurrence, by=list(sorted$Phrase), FUN=sum)
+  colnames(aggregated) <- c("Phrase","Ocurrence")
+  aggregated <- aggregated[ order(-aggregated$Ocurrence), ]
+  
+  # Filter out terms that have appeared on the last terms
+  filtered <- data.frame(Phrase=character(), Ocurrence=numeric(), stringsAsFactors=FALSE)
+  
+  for(i in 1:nrow(aggregated)) {
+    if(aggregated$Phrase[i] != last & aggregated$Phrase[i] != prev1Last & 
+         aggregated$Phrase[i] != prev2Last & aggregated$Phrase[i] != prev3Last) {
+      if(inStrLen >= 4) {
+        searchStr3 <- paste(prev3Last,prev2Last,prev1Last,last,aggregated$Phrase[i], sep=" ");
+        test <- grep (searchStr3, cleanInStr);
+        if(length(test)>0) {
+          next;
+        }
+      }
+      filtered <- rbind(filtered,aggregated[i,]);
+    }
+  }
+    
+  predNxtTerm <- na.omit(filtered)
+  vectTermsTmp <- NULL
+  
+  s2 <- "Other suggested terms: ";
+  if(nrow(predNxtTerm) > 0) {
+    s1 <- paste("Next term: ","[",1,"]:",predNxtTerm$Phrase[1]," ",sep="");
+    for(i in 2:min(nrow(predNxtTerm),5)) {
+      s2 <- paste(s2,"[",i,"]:",predNxtTerm$Phrase[i]," ",sep="");
+    }
+    
+    nextTerm <- s1;
+    otherTerms <- s2;
+  }
+    
+  if (inStrLen > 0){
+    dfTmp1 <- data.frame(nextTerm, otherTerms);
+    return(dfTmp1);
+  } else {
+    nextTerm <- "";
+    otherTerms <-"";
+    dfTmp1 <- data.frame(nextTerm, otherTerms);
+    return(dfTmp1);
+  }
+}
+
+msg <- ""
+shinyServer(function(input, output) {
+  output$prediction <- renderPrint({
+    str2 <- CleanString(input$inputText);
+    strDF <- PredNextTerm(str2);
+    input$action;
+    msg <<- as.character(strDF[1,2]);
+    cat("", as.character(strDF[1,1]))
+    cat("\n\t");
+    cat("\n\t");
+    cat(as.character(strDF[1,2]));
+  })
+  
+  output$text1 <- renderText({
+    paste("Input Sentence: ", input$inputText)});
+  
+  output$text2 <- renderText({
+    input$action;
+    #paste("Note: ", msg);
+  })
+}
+)
